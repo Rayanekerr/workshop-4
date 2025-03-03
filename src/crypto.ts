@@ -1,3 +1,5 @@
+//crypto.ts
+
 import { webcrypto } from "crypto";
 
 // #############
@@ -11,7 +13,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 
 // Function to convert Base64 string to ArrayBuffer
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
-  var buff = Buffer.from(base64, "base64");
+  const buff = Buffer.from(base64, "base64");
   return buff.buffer.slice(buff.byteOffset, buff.byteOffset + buff.byteLength);
 }
 
@@ -93,7 +95,7 @@ export async function rsaEncrypt(
   strPublicKey: string
 ): Promise<string> {
   const publicKey = await importPubKey(strPublicKey);
-  const data = Buffer.from(b64Data, "base64");
+  const data = Buffer.from(b64Data, "utf-8");
   const encrypted = await webcrypto.subtle.encrypt(
     {
       name: "RSA-OAEP",
@@ -117,7 +119,7 @@ export async function rsaDecrypt(
     privateKey,
     buffer
   );
-  return Buffer.from(decrypted).toString("base64");
+  return Buffer.from(decrypted).toString("utf-8");
 }
 
 // ######################
@@ -142,20 +144,6 @@ export async function exportSymKey(key: webcrypto.CryptoKey): Promise<string> {
   return arrayBufferToBase64(exported);
 }
 
-// Import a base64 string format to its crypto native format
-export async function importSymKey(
-  strKey: string
-): Promise<webcrypto.CryptoKey> {
-  const buffer = base64ToArrayBuffer(strKey);
-  return await webcrypto.subtle.importKey(
-    "raw",
-    buffer,
-    "AES-CBC",
-    true,
-    ["encrypt", "decrypt"]
-  );
-}
-
 // Encrypt a message using a symmetric key
 export async function symEncrypt(
   key: webcrypto.CryptoKey,
@@ -178,7 +166,7 @@ export async function symDecrypt(
   strKey: string,
   encryptedData: string
 ): Promise<string> {
-  const [iv, data] = encryptedData.split(":").map(base64ToArrayBuffer);
+  const [iv, data] = encryptedData.split(":").map((part) => base64ToArrayBuffer(part));
   const key = await importSymKey(strKey);
   const decrypted = await webcrypto.subtle.decrypt(
     {
@@ -189,4 +177,18 @@ export async function symDecrypt(
     data
   );
   return new TextDecoder().decode(decrypted);
+}
+
+// Import a base64 string format to its crypto native format
+export async function importSymKey(
+  strKey: string
+): Promise<webcrypto.CryptoKey> {
+  const buffer = base64ToArrayBuffer(strKey);
+  return await webcrypto.subtle.importKey(
+    "raw",
+    buffer,
+    "AES-CBC",
+    true,
+    ["encrypt", "decrypt"]
+  );
 }
