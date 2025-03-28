@@ -5,7 +5,7 @@ export async function launchOnionRouters(n: number) {
 
   // launch a n onion routers
   for (let index = 0; index < n; index++) {
-    const newPromise = simpleOnionRouter(index);
+    const newPromise = await simpleOnionRouter(index);
     promises.push(newPromise);
   }
 

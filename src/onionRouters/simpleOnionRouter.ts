@@ -1,143 +1,76 @@
-// simpleOnionRouter.ts
-// Import required modules and dependencies
-import bodyParser from "body-parser";
-import express, { Request, Response } from "express";
-import axios from "axios";
-import { BASE_ONION_ROUTER_PORT } from "../config";
-import { registerNode } from "../registry/registry";
-import {
-  exportPrvKey,
-  exportPubKey,
-  generateRsaKeyPair,
-  rsaDecrypt,
-  symDecrypt,
-} from "../crypto";
+import express from "express";
+import { BASE_ONION_ROUTER_PORT, REGISTRY_PORT } from "../config";
+import { generateRsaKeyPair, exportPubKey, rsaDecrypt, symDecrypt, exportPrvKey } from "../crypto";
+import { Node } from "../registry/registry";
 
-// Global variables to store message states
-let lastReceivedEncryptedMessage: string | null = null;
-let lastReceivedDecryptedMessage: string | null = null;
-let lastMessageDestination: number | null = null;
-let lastReceivedMessage: string | null = null;
-let lastSentMessage: string | null = null;
-let lastForwardedMessage: string | null = null;
-let lastForwardedNode: number | null = null;
-
-/**
- * Initializes the Onion Router instance with a unique node ID.
- * @param nodeId - The ID of the Onion Router node.
- * @returns The Express server instance.
- */
 export async function simpleOnionRouter(nodeId: number) {
   const onionRouter = express();
   onionRouter.use(express.json());
-  onionRouter.use(bodyParser.json());
-  onionRouter.set("id", nodeId);
 
-  // Generate and set RSA key pair
-  await generateRsaKeyPair().then((data) => {
-    onionRouter.set("pubKey", data.publicKey);
-    onionRouter.set("privKey", data.privateKey);
-  });
+  let lastReceivedEncryptedMessage: string | null = null;
+  let lastReceivedDecryptedMessage: string | null = null;
+  let lastMessageDestination: number | null = null;
+  
+  const { publicKey, privateKey } = await generateRsaKeyPair();
+  const pubKey = await exportPubKey(publicKey);
 
-  // Register the node with its public key
-  await registerNode(
-    onionRouter.get("id"),
-    await exportPubKey(onionRouter.get("pubKey"))
-  );
+  // Routes
+  onionRouter.get("/status", (req, res) => res.send("live"));
+  onionRouter.get("/getLastReceivedEncryptedMessage", (req, res) => res.json({ result: lastReceivedEncryptedMessage }));
+  onionRouter.get("/getLastReceivedDecryptedMessage", (req, res) => res.json({ result: lastReceivedDecryptedMessage }));
+  onionRouter.get("/getLastMessageDestination", (req, res) => res.json({ result: lastMessageDestination }));
+  onionRouter.get("/getPrivateKey", async (req, res) => res.json({ result: await exportPrvKey(privateKey) }));
 
-  // Route: Status Check
-  onionRouter.get("/status", (req: Request, res: Response) => {
-    res.send("live");
-  });
-
-  // Route: Retrieve the last received encrypted message
-  onionRouter.get("/getLastReceivedEncryptedMessage", (req, res) => {
-    res.status(200).json({ result: lastReceivedEncryptedMessage });
-  });
-
-  // Route: Retrieve the last received decrypted message
-  onionRouter.get("/getLastReceivedDecryptedMessage", (req, res) => {
-    res.status(200).json({ result: lastReceivedDecryptedMessage });
-  });
-
-  // Route: Retrieve the last message destination
-  onionRouter.get("/getLastMessageDestination", (req, res) => {
-    res.status(200).json({ result: lastMessageDestination });
-  });
-
-  // Route: Retrieve the private key (for testing purposes only)
-  onionRouter.get("/getPrivateKey", async (req, res) => {
-    res.json({ result: await exportPrvKey(onionRouter.get("privKey")) });
-  });
-
-  // Route: Handle incoming messages
-  onionRouter.post("/message", async (req: Request, res: Response) => {
-    let encryptedMessage = req.body.message;
-    const privateKey = onionRouter.get("privKey");
-
+  onionRouter.post("/message", async (req, res) => {
     try {
-      // Decrypt symmetric key and message
-      const encryptedSymKey = encryptedMessage.slice(0, 342) + "==";
-      const encryptedData = encryptedMessage.slice(342);
-      const symKeyBase64 = await rsaDecrypt(encryptedSymKey, privateKey);
-      const decryptedData = await symDecrypt(symKeyBase64, encryptedData);
-      const nextHop = parseInt(decryptedData.slice(0, 10), 10);
-      const decryptedMessage = decryptedData.slice(10);
+      const { message } = req.body;
+      lastReceivedEncryptedMessage = message;
 
-      // Update state variables
-      lastReceivedEncryptedMessage = encryptedMessage;
-      lastReceivedDecryptedMessage = decryptedMessage;
-      lastMessageDestination = nextHop;
+      const encryptedSymKey = message.slice(0, 344);
+      const symEncryptedData = message.slice(344);
 
-      // Prepare message for forwarding
-      const prepareMessage = (msg: string) =>
-        Buffer.from(msg, "base64").toString("utf8").slice(0, -1);
+      const symmetricKey = await rsaDecrypt(encryptedSymKey, privateKey);
+      const decryptedData = await symDecrypt(symmetricKey, symEncryptedData);
 
-      // Send the message to the next hop
-      const sendMessage = async (destination: number, message: string) => {
-        const url = `http://localhost:${destination}/message`;
-        try {
-          await axios.post(url, { message }, { headers: { "Content-Type": "application/json" } });
-          lastForwardedNode = destination;
-          lastForwardedMessage = message;
-          console.log(`Message sent to ${destination}`);
-        } catch (error) {
-          console.error(`Failed to send message to ${destination}:`, error);
-          throw error;
-        }
-      };
+      const nextDestination = parseInt(decryptedData.slice(0, 10), 10);
+      const innerMessage = decryptedData.slice(10);
 
-      // Determine if the message is for a user or another node
-      if (nextHop < BASE_ONION_ROUTER_PORT) {
-        console.log("Jump to user:", nextHop);
-        await sendMessage(nextHop, prepareMessage(decryptedMessage));
-      } else {
-        console.log("Jump to node:", nextHop);
-        await sendMessage(nextHop, decryptedMessage);
-      }
+      lastReceivedDecryptedMessage = innerMessage;
+      lastMessageDestination = nextDestination;
 
-      res.send("success");
-    } catch (err) {
-      console.error("Error processing message:", err);
-      res.status(500).json({ error: "error" });
+      await fetch(`http://localhost:${nextDestination}/message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: innerMessage }),
+      });
+
+      res.status(200).send("Message forwarded");
+    } catch (error) {
+      console.error("Error processing message:", error);
+      res.status(500).send("Error processing message");
     }
   });
 
-  // Additional routes for forwarded message information
-  onionRouter.get("/getLastForwardedNode", (req, res) => {
-    res.status(200).json({ result: lastForwardedNode });
+  const server = onionRouter.listen(BASE_ONION_ROUTER_PORT + nodeId);
+
+  // Wait for server to start
+  await new Promise<void>((resolve) => {
+    server.on('listening', () => {
+      console.log(`Onion router ${nodeId} listening on port ${BASE_ONION_ROUTER_PORT + nodeId}`);
+      resolve();
+    });
   });
 
-  onionRouter.get("/getLastForwardedMessage", (req, res) => {
-    res.status(200).json({ result: lastForwardedMessage });
-  });
-
-  // Start the server on the assigned port
-  const server = onionRouter.listen(BASE_ONION_ROUTER_PORT + nodeId, () => {
-    console.log(
-      `Onion router ${nodeId} is listening on port ${BASE_ONION_ROUTER_PORT + nodeId}`
-    );
-  });
+  // Register node
+  try {
+    await fetch(`http://localhost:${REGISTRY_PORT}/registerNode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ nodeId, pubKey }),
+    });
+  } catch (err) {
+    console.error(`Node ${nodeId} registration error:`, err);
+  }
 
   return server;
 }

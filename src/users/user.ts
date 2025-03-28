@@ -1,112 +1,97 @@
-// user.ts
-// Import required modules and dependencies
-import express, { Request, Response } from "express";
 import bodyParser from "body-parser";
-import { BASE_USER_PORT, BASE_ONION_ROUTER_PORT } from "../config";
-import { nodes } from "../registry/registry";
-import {
-  createRandomSymmetricKey,
-  exportSymKey,
-  rsaEncrypt,
-  symEncrypt,
-} from "../crypto";
+import express from "express";
+import { BASE_USER_PORT,BASE_ONION_ROUTER_PORT, REGISTRY_PORT } from "../config";
+import { createRandomSymmetricKey, exportSymKey, symEncrypt, rsaEncrypt } from "../crypto";
+import { GetNodeRegistryBody, Node } from "../registry/registry";
 
-// Global variables to store message states
-let lastReceivedMessage: string | null = null;
-let lastSentMessage: string | null = null;
+export type SendMessageBody = {
+  message: string;
+  destinationUserId: number;
+};
 
-/**
- * Initializes a user instance with a unique user ID.
- * @param userId - The ID of the user.
- * @returns The Express server instance.
- */
 export async function user(userId: number) {
-  const app = express();
-  app.use(express.json());
-  app.use(bodyParser.json());
+  const _user = express();
+  _user.use(express.json());
+  _user.use(bodyParser.json());
 
-  app.set('circuit', null);
+  let lastReceivedMessage: string | null = null;
+  let lastSentMessage: string | null = null;
+  let lastCircuit: number[] = [];
 
-  // Route: Status Check
-  app.get("/status", (req: Request, res: Response) => {
-    res.status(200).send("live");
+  // Routes
+  _user.get("/status", (req, res) => res.send("live"));
+  _user.get("/getLastReceivedMessage", (req, res) => res.json({ result: lastReceivedMessage }));
+  _user.get("/getLastSentMessage", (req, res) => res.json({ result: lastSentMessage }));
+  _user.get("/getLastCircuit", (req, res) => res.json({ result: lastCircuit }));
+
+  _user.post("/message", (req, res) => {
+    lastReceivedMessage = req.body.message;
+    res.status(200).send("success");
   });
 
-  // Route: Get the last received message
-  app.get("/getLastReceivedMessage", (req: Request, res: Response) => {
-    res.status(200).json({ result: lastReceivedMessage });
-  });
+  _user.post("/sendMessage", async (req, res) => {
+    try {
+      const { message, destinationUserId } = req.body;
+      lastSentMessage = message;
 
-  // Route: Get the last sent message
-  app.get("/getLastSentMessage", (req: Request, res: Response) => {
-    res.status(200).json({ result: lastSentMessage });
-  });
-
-  // Route: Get the last circuit used
-  app.get("/getLastCircuit", (req: Request, res: Response) => {
-    res.status(200).json({ result: app.get('circuit') });
-  });
-
-  // Route: Handle incoming messages
-  app.post("/message", (req: Request, res: Response) => {
-    const { message } = req.body;
-    console.log("Message received for user:", userId);
-    console.log(message);
-    lastReceivedMessage = message;
-    res.send("success");
-  });
-
-  // Route: Send a message through the Onion Router network
-  app.post("/sendMessage", async (req: Request, res: Response) => {
-    const { message, destinationUserId } = req.body;
-    console.log("Sending message from user:", userId);
-    console.log(`Message: ${message}, Destination User ID: ${destinationUserId}`);
-    lastSentMessage = message;
-
-    if (nodes.length < 3) {
-      res.status(500).json({ error: "Not enough nodes in the registry" });
-      return;
-    }
-
-    const circuit = nodes.sort(() => Math.random() - 0.5).slice(0, 3);
-    const node_circuit: number[] = circuit.map(value => value.nodeId);
-    app.set("circuit", node_circuit);
-
-    let encryptedMessage = Buffer.from(message + ' ', 'utf8').toString('base64');
-
-    for (let i = circuit.length - 1; i >= 0; i--) {
-      const node = circuit[i];
-
-      const symKey = await createRandomSymmetricKey();
-      const symKeyBase64 = await exportSymKey(symKey);
-
-      const nextHop = i === circuit.length - 1
-        ? BASE_USER_PORT + destinationUserId
-        : BASE_ONION_ROUTER_PORT + circuit[i + 1].nodeId;
-
-      const nextHopStr = nextHop.toString().padStart(10, "0");
-      console.log('New hop:', nextHopStr);
-
-      encryptedMessage = await symEncrypt(symKey, nextHopStr + encryptedMessage);
-      const encryptedSymKey = await rsaEncrypt(symKeyBase64, node.pubKey);
-      encryptedMessage = encryptedSymKey.slice(0, -2) + encryptedMessage;
-    }
-
-    const entryNode = circuit[0];
-    await fetch(
-      `http://localhost:${BASE_ONION_ROUTER_PORT + entryNode.nodeId}/message`,
-      {
-        method: 'post',
-        body: JSON.stringify({ message: encryptedMessage }),
-        headers: { 'Content-Type': 'application/json' }
+      // Get node registry
+      const nodesResponse = await fetch(`http://localhost:${REGISTRY_PORT}/getNodeRegistry`);
+      const registry: GetNodeRegistryBody = await nodesResponse.json() as GetNodeRegistryBody;;
+      
+      // Create circuit with 3 unique nodes
+      const nodes = registry.nodes;
+      const circuit: Node[] = [];
+      const availableNodes = [...nodes];
+      
+      while (circuit.length < 3 && availableNodes.length >= 3) {
+        const randomIndex = Math.floor(Math.random() * availableNodes.length);
+        const [node] = availableNodes.splice(randomIndex, 1);
+        if (!circuit.some(n => n.nodeId === node.nodeId)) {
+          circuit.push(node);
+        }
       }
-    );
 
-    res.send("success");
+      if (circuit.length < 3) {
+        throw new Error("Not enough nodes to create a circuit");
+      }
+
+      lastCircuit = circuit.map(node => node.nodeId);
+
+      let finalMessage = message;
+      let destination = `${BASE_USER_PORT + destinationUserId}`.padStart(10, "0");
+
+      // Encrypt in reverse order (last node first)
+      for (let i = circuit.length - 1; i >= 0; i--) {
+        const node = circuit[i];
+        const symKey = await createRandomSymmetricKey();
+        const exportedSymKey = await exportSymKey(symKey);
+
+        // Create layer
+        const messageToEncrypt = `${destination}${finalMessage}`;
+        const encryptedMessage = await symEncrypt(symKey, messageToEncrypt);
+        const encryptedSymKey = await rsaEncrypt(exportedSymKey, node.pubKey);
+
+        // Update values for next iteration
+        destination = `${BASE_ONION_ROUTER_PORT + node.nodeId}`.padStart(10, "0");
+        finalMessage = encryptedSymKey + encryptedMessage;
+      }
+
+      // Send to first node
+      await fetch(`http://localhost:${BASE_ONION_ROUTER_PORT + circuit[0].nodeId}/message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: finalMessage }),
+      });
+
+      res.status(200).send("Message sent");
+    } catch (error) {
+      console.error(error);
+      res.status(500).send("Error sending message");
+    }
   });
 
-  // Start the server on the assigned port
-  const server = app.listen(BASE_USER_PORT + userId, () => {
+  // Add the missing server initialization
+  const server = _user.listen(BASE_USER_PORT + userId, () => {
     console.log(`User ${userId} listening on port ${BASE_USER_PORT + userId}`);
   });
 
